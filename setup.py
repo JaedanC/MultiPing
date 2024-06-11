@@ -6,6 +6,5 @@ freeze(
     console=[{"script": "mping.py"}],
     options={
         "packages": ["tabulate"],
-        "bundle_files": 1
     }
 )
