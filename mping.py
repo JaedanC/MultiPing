@@ -23,14 +23,14 @@ class PingResult:
             line_match = ip_regex.match(line)
             if line_match is not None:
                 self.ip = line_match.group(1)
-            
+
             line_match = stats_regex.match(line)
             if line_match is not None:
                 self.sent = line_match.group(1)
                 self.received = line_match.group(2)
                 self.lost = line_match.group(3)
                 self.lost_percent = line_match.group(4)
-            
+
             line_match = time_regex.match(line)
             if line_match is not None:
                 self.trip_time = "min: {}, max: {}, avg: {}".format(
@@ -92,18 +92,18 @@ def main():
         if option.startswith("--csv="):
             use_csv = True
             csv_filename = option.split("--csv=")[1]
-    
+
         if option.startswith("--threads="):
             try:
                 n_threads = int(option.split("--threads=")[1])
             except ValueError:
                 print("nthreads must be an integer")
                 return
-            
+
             if n_threads < 1 or n_threads > 1024:
                 print("nthreads must be in the range [1-1024]")
                 return
-        
+
         if option.startswith("--nameserver="):
             custom_nameserver = option.split("--nameserver=")[1]
 
@@ -115,13 +115,13 @@ def main():
     if len(ip_input.split(".")) != 4:
         print("Not in a valid ip address")
         return
-    
+
     ip, subnet = ip_input.split("/")
     try:
         if int(subnet) < 16:
             print("Too broad a subnet. Must be >= 16")
             return
-        
+
         if int(subnet) > 32:
             print("Not a valid subnet. Must be <= 32")
             return
@@ -152,7 +152,7 @@ def main():
         except KeyboardInterrupt:
             print("Cancelling")
             return
-    
+
     def ping(ip):
         """
         Worker function for each thread to perform. Run ping and nslookup.
@@ -174,7 +174,7 @@ def main():
         print()
         print("Killing threads")
         return
-    
+
     df = pd.DataFrame.from_records(results)
     printable_df = df.drop(columns=["ping_result", "nslookup_result"])
 
