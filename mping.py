@@ -1,194 +1,165 @@
 from multiprocessing.pool import ThreadPool
+from typing import List, Optional, Tuple
+import argparse
 import ipaddress
-import os
 import pandas as pd
-import re
 import sys
 
-
-class PingResult:
-    def __init__(self, ping_result: str):
-        ip_regex = re.compile(r"Pinging (?:(.*?) )with 32 bytes of data")
-        stats_regex = re.compile(r"    Packets: Sent = (\d+), Received = (\d+), Lost = (\d+) \((\d+)% loss\),")
-        time_regex = re.compile(r"    Minimum = (\d+)ms, Maximum = (\d+)ms, Average = (\d+)ms")
-        self.ping_result = ping_result
-        self.ip = None
-        self.sent = None
-        self.received = None
-        self.lost = None
-        self.lost_percent = None
-        self.trip_time = None
-
-        for line in ping_result.split("\n"):
-            line_match = ip_regex.match(line)
-            if line_match is not None:
-                self.ip = line_match.group(1)
-
-            line_match = stats_regex.match(line)
-            if line_match is not None:
-                self.sent = line_match.group(1)
-                self.received = line_match.group(2)
-                self.lost = line_match.group(3)
-                self.lost_percent = line_match.group(4)
-
-            line_match = time_regex.match(line)
-            if line_match is not None:
-                self.trip_time = "min: {}, max: {}, avg: {}".format(
-                    line_match.group(1),
-                    line_match.group(2),
-                    line_match.group(3),
-                )
-
-
-class NSLookupResult:
-    def __init__(self, nslookup_result: str):
-        name_regex = re.compile(r"Name:\s+(.*)")
-        self.nslookup_result = nslookup_result
-        self.nslookup = None
-        for line in nslookup_result.split("\n"):
-            line_match = name_regex.match(line)
-            if line_match is not None:
-                self.nslookup = line_match.group(1)
-                break
-
-
-def subnet_calculator(ip_subnet):
-    (addr, cidr) = ip_subnet.split('/')
-
-    addr = [int(x) for x in addr.split(".")]
-    cidr = int(cidr)
-    mask = [( ((1<<32)-1) << (32-cidr) >> i ) & 255 for i in reversed(range(0, 32, 8))]
-    netw = [addr[i] & mask[i] for i in range(4)]
-    bcas = [(addr[i] & mask[i]) | (255^mask[i]) for i in range(4)]
-
-    netw_str = '.'.join(map(str, netw))
-    print("Address: {0}".format('.'.join(map(str, addr))))
-    print("Mask: {0}".format('.'.join(map(str, mask))))
-    print("Cidr: {0}".format(cidr))
-    print("Network: {0}".format('.'.join(map(str, netw))))
-    print("Broadcast: {0}".format('.'.join(map(str, bcas))))
-    return list(ipaddress.ip_network("{}/{}".format(netw_str, cidr)).hosts())
+import dns.resolver
+import dns.reversename
+import ping3
+ping3.EXCEPTIONS = True
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("multiping <ip/subnet> [options]")
-        print("    --csv=<filename>       Output to a csv. Includes raw output of the commands.")
-        print("    --threads=<numbers>    Change the number of threads used by default to ping.")
-        print("    --nameserver=<server>  Use a specific nameserver for nslookup.")
-        return
+    DEFAULT_THREADS = 2048
+    DEFAULT_PING_COUNT = 4
+    parser = argparse.ArgumentParser(
+        prog="python " + sys.argv[0],
+        description="Ping a subnet"
+    )
+    parser.add_argument(
+        "subnet",
+        action="store",
+        help="The subnet to ping",
+    )
+    parser.add_argument(
+        "--csv",
+        action="store",
+        dest="to_csv",
+        help="Output to a csv. Includes raw output of the commands."
+    )
+    parser.add_argument(
+        "-t",
+        action="store",
+        dest="n_threads",
+        default=DEFAULT_THREADS,
+        type=int,
+        help=f"The number of threads to ping with. Default: {DEFAULT_THREADS}"
+    )
+    parser.add_argument(
+        "-n",
+        action="store",
+        dest="n_pings",
+        default=DEFAULT_PING_COUNT,
+        type=int,
+        help=f"The number of pings to do. Default: {DEFAULT_PING_COUNT}"
+    )
+    parser.add_argument(
+        "--dns",
+        action="store",
+        dest="dns_server",
+        help="The DNS to use for nslookup"
+    )
+    args = parser.parse_args()
+    subnet = args.subnet
+    to_csv = args.to_csv
+    n_threads = args.n_threads
+    n_pings = args.n_pings
+    dns_server = args.dns_server
 
-    # Input validation
-    ip_input = sys.argv[1]
-    options = sys.argv[2:]
+    if n_threads <= 0:
+        parser.error("Threads must be greater than 0")
 
-    use_csv = False
-    csv_filename = ""
-
-    n_threads = 256
-
-    custom_nameserver = ""
-    for option in options:
-        if option.startswith("--csv="):
-            use_csv = True
-            csv_filename = option.split("--csv=")[1]
-
-        if option.startswith("--threads="):
-            try:
-                n_threads = int(option.split("--threads=")[1])
-            except ValueError:
-                print("nthreads must be an integer")
-                return
-
-            if n_threads < 1 or n_threads > 1024:
-                print("nthreads must be in the range [1-1024]")
-                return
-
-        if option.startswith("--nameserver="):
-            custom_nameserver = option.split("--nameserver=")[1]
-
-
-    if len(ip_input.split("/")) != 2:
-        print("Must include a subnet")
-        return
-
-    if len(ip_input.split(".")) != 4:
-        print("Not in a valid ip address")
-        return
-
-    ip, subnet = ip_input.split("/")
-    try:
-        if int(subnet) < 16:
-            print("Too broad a subnet. Must be >= 16")
-            return
-
-        if int(subnet) > 32:
-            print("Not a valid subnet. Must be <= 32")
-            return
-    except ValueError:
-        print("Not a valid subnet")
-        return
+    if n_pings <= 0:
+        parser.error("Pings must be greater than 0")
 
     try:
-        for sub_ip in ip.split("."):
-            if int(sub_ip) < 0 or int(sub_ip) > 255:
-                print("ip contains an invalid value")
-                return
-    except ValueError:
-        print("Not a valid ip")
+        subnet = ipaddress.IPv4Network(subnet, strict=False)
+    except ipaddress.AddressValueError:
+        parser.error("Not a valid address")
         return
+    except ipaddress.NetmaskValueError:
+        parser.error("Not a valid subnet")
+        return
+
+    if subnet.prefixlen < 16:
+        parser.error("Too broad a subnet. Must be >= 16")
+        return
+
+    print(f"Pinging:   {subnet}")
+    print()
+    print(f"Mask:      {subnet.netmask}")
+    print(f"Cidr:      {subnet.prefixlen}")
+    print(f"Network:   {subnet.network_address}")
+    print(f"Broadcast: {subnet.broadcast_address}")
 
     # Returns a list of ips inside the specified subnet
-    ips = subnet_calculator(ip_input)
+    ips = list(subnet.hosts())
 
     # Final chance to abort
     print()
+    print("Pinging {} time{} for {} IP{} in range using {} thread{}:".format(
+        n_pings,
+        "s" if n_pings > 1 else "",
+        len(ips),
+        "s" if len(ips) > 1 else "",
+        min(n_threads, len(ips)),
+        "s" if n_threads > 1 else ""
+    ))
     if len(ips) > 1:
-        print("Pinging range with {} thread{}:".format(n_threads, "s" if n_threads > 1 else ""))
         print("{} -> {}".format(ips[0], ips[-1]))
-        print("Press enter to continue (ctrl+c to cancel)")
-        try:
-            input()
-        except KeyboardInterrupt:
-            print("Cancelling")
-            return
+
+    if to_csv is not None:
+        print(f"Once done will save to {to_csv}")
+
+    print()
+    print("Press enter to continue (ctrl+c to cancel)")
+    try:
+        input()
+    except KeyboardInterrupt:
+        return
+
 
     def ping(ip):
-        """
-        Worker function for each thread to perform. Run ping and nslookup.
-        """
         print(f"Pinging {ip}")
-        ping_text = os.popen(f"ping {ip}").read()
-        nslookup_text = os.popen(f"nslookup {ip} {custom_nameserver}").read()
+        responses = []
+        for _ in range(n_pings):
+            try:
+                response_time = ping3.ping(
+                    str(ip),
+                    unit="ms"
+                )
+                responses.append("{}ms".format(round(response_time)))
+            except ping3.errors.PingError:
+                responses.append("_")
 
-        pr = PingResult(ping_text).__dict__
-        ns = NSLookupResult(nslookup_text).__dict__
-        pr.update(ns)
-        return pr
+        dns_responses = []
+        try:
+            dns_resolver = dns.resolver.Resolver()
+            if dns_server is not None:
+                dns_resolver.nameservers = [dns_server]
+            reverse_name = dns.reversename.from_address(str(ip))
+            answer = dns_resolver.resolve(reverse_name, "PTR")
+            for rdata in answer:
+                dns_responses.append(rdata.to_text())
+        except Exception:
+            pass
 
-    results = []
+        return (ip, ", ".join(responses), ",".join(dns_responses))
+
+    results: List[Tuple[str, int, Optional[str], str, Optional[str]]] = []
     try:
-        with ThreadPool(n_threads) as tp:
+        with ThreadPool(min(n_threads, len(ips))) as tp:
             results = tp.map(ping, ips)
     except KeyboardInterrupt:
         print()
         print("Killing threads")
         return
 
-    df = pd.DataFrame.from_records(results)
-    printable_df = df.drop(columns=["ping_result", "nslookup_result"])
+    df = pd.DataFrame.from_records(results, columns=["ip", "responses", "nslookup"])
 
-    if use_csv:
+    print(df.to_markdown())
+
+    if to_csv is not None:
         try:
-            print("Writing csv...")
-            with open(csv_filename, "w") as f:
+            print(f"Writing {to_csv}")
+            with open(to_csv, "w", encoding="utf-8") as f:
                 f.write(df.to_csv(lineterminator="\n"))
         except PermissionError:
-            print(f"Cannot write to {csv_filename} at the moment. Using stdout.")
+            print(f"Cannot write to {to_csv} at the moment. Using stdout.")
             print()
-            print(printable_df.to_markdown())
-    else:
-        print(printable_df.to_markdown())
+            print(df.to_markdown())
 
 
 if __name__ == "__main__":

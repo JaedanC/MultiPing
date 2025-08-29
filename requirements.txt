@@ -1,3 +1,5 @@
-pandas
-tabulate
+dnspython
 numpy
+pandas
+ping3
+tabulate
